@@ -1,79 +1,167 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Solaria City - Deterministic Staged Scene Generator for Screenshots & Testing
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { CONFIG } from './config.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+export class ShotsManager {
+  static checkAndApplyStagedShot(game) {
+    const params = new URLSearchParams(window.location.search);
+    const shot = params.get('shot');
+    if (!shot) return false;
+
+    console.log(`[ShotsManager] Applying staged scene for shot: ${shot}`);
+
+    if (shot === 'cover' || shot === '1-cover' || shot === 'start') {
+      game.isStaged = true;
+      ShotsManager.stageCoverScene(game);
+      return true;
+    } else if (shot === 'skyline' || shot === '2-skyline' || shot === 'play') {
+      game.isStaged = true;
+      ShotsManager.stageSkylineScene(game);
+      return true;
+    } else if (shot === 'action' || shot === '3-action' || shot === 'end') {
+      game.isStaged = true;
+      ShotsManager.stageActionScene(game);
+      return true;
+    } else if (shot === 'mission' || shot === '4-mission') {
+      game.isStaged = true;
+      ShotsManager.stageMissionScene(game);
+      return true;
     }
-  }
-  return Infinity;
-}
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+    return false;
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+
+  static stageCoverScene(game) {
+    const { player, vehicleManager, policeManager, missionManager, camera } = game;
+
+    // 1. Position Player in Solaria Venom GT on Ocean Drive
+    const venomCfg = CONFIG.VEHICLES.venom;
+    const venom = new (vehicleManager.vehicles[0].constructor)(game.scene, venomCfg, 174.2, 48, 0.08);
+    venom.velocity = 35.0; // 80 MPH
+    vehicleManager.vehicles.push(venom);
+    vehicleManager.playerVehicle = venom;
+    player.enterVehicle(venom);
+
+    // 2. Spawn 2 Police Interceptors in hot pursuit
+    const police1 = policeManager.vehicleManager.spawnPoliceCruiser(176.8, 38, 0.04);
+    police1.velocity = 34.0;
+    police1.sirenActive = true;
+    policeManager.policeCars.push(police1);
+
+    const police2 = policeManager.vehicleManager.spawnPoliceCruiser(171.5, 30, -0.02);
+    police2.velocity = 34.5;
+    police2.sirenActive = true;
+    policeManager.policeCars.push(police2);
+
+    // 3. Set 3 Wanted Stars
+    policeManager.wantedStars = 3;
+
+    // 4. Mission state & Dialogue
+    missionManager.startMission('mission_1');
+    missionManager.activeMission.stages[1].text = 'LOSE THE METRO PD PURSUIT & DELIVER CONTRABAND';
+    missionManager.currentStageIndex = 1;
+    missionManager.showDialogue(
+      'LEO "FIN" CASTILLO',
+      'Lose the cruisers on Ocean Drive! Take the alleys before they set up a roadblock!'
+    );
+
+    // 5. Cinematic Action Camera: Low angle behind police cruisers looking forward
+    camera.position.set(180.5, 3.4, 23.5);
+    camera.lookAt(173.8, 2.0, 48.0);
+
+    // Update HUD
+    game.hud.update(player, game.city, vehicleManager, game.trafficManager, policeManager, missionManager);
+    game.renderer.render(game.scene, game.camera);
+  }
+
+  static stageSkylineScene(game) {
+    const { player, vehicleManager, camera, trafficManager, policeManager, missionManager } = game;
+
+    // Position player vehicle at coastal promenade
+    const titanCfg = CONFIG.VEHICLES.titan;
+    const suv = new (vehicleManager.vehicles[0].constructor)(game.scene, titanCfg, 175, -40, 0);
+    suv.velocity = 18.0;
+    vehicleManager.vehicles.push(suv);
+    vehicleManager.playerVehicle = suv;
+    player.enterVehicle(suv);
+
+    // Camera high vantage showing coastline, palm trees, ocean, yachts and city skyline
+    camera.position.set(205, 20.0, -90);
+    camera.lookAt(120, 8.0, 10);
+
+    // Update HUD
+    game.hud.update(player, game.city, vehicleManager, trafficManager, policeManager, missionManager);
+    game.renderer.render(game.scene, game.camera);
+  }
+
+  static stageActionScene(game) {
+    const { player, missionManager, policeManager, camera, trafficManager, vehicleManager } = game;
+
+    // On foot player aiming pistol outside Downtown Neon Club
+    player.position = { x: 31.5, y: 0.35, z: 23.0 };
+    player.heading = 0.25; // Aiming towards targets
+    player.currentWeaponIndex = 1; // 9mm Pistol
+    player.isAiming = true;
+    player.rightArm.rotation.x = Math.PI / 2.1; // Outstretched aiming arm
+    player.ammo.pistol = 9;
+    player.health = 85;
+    player.armor = 40;
+
+    // Spawn syndicate combatants directly in line of sight
+    missionManager.spawnSyndicateEnemies(3);
+    if (missionManager.enemies.length >= 3) {
+      missionManager.enemies[0].group.position.set(34.5, 0.35, 32.0);
+      missionManager.enemies[1].group.position.set(37.5, 0.35, 34.0);
+      missionManager.enemies[2].group.position.set(31.0, 0.35, 36.0);
     }
-  }
-  return best;
-}
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+    // Pedestrians fleeing in terror
+    trafficManager.alertPedestriansNearby(player.position, 40);
+
+    // 2 Wanted Stars
+    policeManager.wantedStars = 2;
+
+    // Over-The-Shoulder Camera: Framed with player on left, targets in center
+    camera.position.set(29.8, 1.85, 19.5);
+    camera.lookAt(34.5, 1.55, 32.0);
+
+    // Trigger visual muzzle flash at gun tip
+    player.muzzleGroup.position.set(32.4, 1.5, 24.2);
+    player.muzzleGroup.visible = true;
+    player.muzzleLight.intensity = 5.0;
+
+    // Crosshair active
+    const crossEl = document.getElementById('hud-crosshair');
+    if (crossEl) crossEl.classList.remove('hidden');
+
+    // Update HUD
+    game.hud.update(player, game.city, vehicleManager, trafficManager, policeManager, missionManager);
+    game.renderer.render(game.scene, game.camera);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  static stageMissionScene(game) {
+    const { player, missionManager, camera, vehicleManager, policeManager, trafficManager } = game;
+
+    // Player standing at Marina docks facing Fin and luxury yachts
+    player.position = { x: 10, y: 0.35, z: -155 };
+    player.heading = Math.PI;
+
+    // Start Mission 2 & show glowing waypoint
+    missionManager.startMission('mission_2');
+    missionManager.markerMesh.visible = true;
+    missionManager.markerMesh.position.set(9.5, 0.4, -162.0);
+
+    missionManager.showDialogue(
+      'LEO "FIN" CASTILLO',
+      'The contraband just docked at Palma Marina. Secure it before the precinct locks down the perimeter!'
+    );
+
+    // Cinematic dialogue camera angle framing player, 3D waypoint, and Marina yachts
+    camera.position.set(13.8, 2.3, -151.0);
+    camera.lookAt(9.0, 1.5, -162.0);
+
+    // Update HUD
+    game.hud.update(player, game.city, vehicleManager, trafficManager, policeManager, missionManager);
+    game.renderer.render(game.scene, game.camera);
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
 }

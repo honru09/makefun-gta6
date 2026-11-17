@@ -1,134 +1,348 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// Solaria City: Sunstate Underworld - Main Game Orchestrator & Game Loop
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+import { CONFIG } from './config.js';
+import { AudioManager } from './audio.js';
+import { City } from './city.js';
+import { VehicleManager } from './vehicles.js';
+import { Player } from './player.js';
+import { TrafficManager } from './traffic.js';
+import { PoliceManager } from './police.js';
+import { MissionManager } from './missions.js';
+import { HUD } from './hud.js';
+import { SaveSystem } from './save.js';
+import { ShotsManager } from './shots.js';
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+export class Game {
+  constructor() {
+    this.state = 'START_SCREEN'; // 'START_SCREEN', 'PLAYING', 'PAUSED'
+    this.isPaused = false;
+    this.isStaged = false;
+    this.clock = null;
+    this.lastTime = performance.now();
 
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+    // Input State
+    this.input = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      sprint: false,
+      jump: false,
+      brake: false,
+      attack: false,
+      aim: false,
+    };
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
+    this.initGraphics();
+    this.initAudio();
+    this.initWorld();
+    this.initHUD();
+    this.setupInputListeners();
+    this.setupMenus();
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+    // Check if deterministic staged shot query is present
+    const isShot = ShotsManager.checkAndApplyStagedShot(this);
+    if (isShot) {
+      this.state = 'PLAYING';
+      const menuEl = document.getElementById('menu-start');
+      if (menuEl) menuEl.classList.add('hidden');
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+
+    // Start Main RAF Loop
+    this.loop = this.loop.bind(this);
+    requestAnimationFrame(this.loop);
   }
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
+  initGraphics() {
+    const THREE = window.THREE;
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x74b9ff); // Sun-soaked coastal sky blue
+    this.scene.fog = new THREE.FogExp2(0x74b9ff, 0.0035);
+
+    const aspect = window.innerWidth / window.innerHeight;
+    this.camera = new THREE.PerspectiveCamera(65, aspect, 0.1, 800);
+
+    const canvas = document.getElementById('game-canvas');
+    this.renderer = new THREE.WebGLRenderer({
+      canvas: canvas,
+      antialias: true,
+      powerPreference: 'high-performance',
+    });
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // Sunlight (Directional) with shadows - Warm golden angle from behind/side
+    this.sunLight = new THREE.DirectionalLight(0xfffaed, 1.15);
+    this.sunLight.position.set(80, 140, -100);
+    this.sunLight.castShadow = true;
+    this.sunLight.shadow.mapSize.width = 2048;
+    this.sunLight.shadow.mapSize.height = 2048;
+    this.sunLight.shadow.camera.near = 10;
+    this.sunLight.shadow.camera.far = 400;
+    const shadowD = 90;
+    this.sunLight.shadow.camera.left = -shadowD;
+    this.sunLight.shadow.camera.right = shadowD;
+    this.sunLight.shadow.camera.top = shadowD;
+    this.sunLight.shadow.camera.bottom = -shadowD;
+    this.scene.add(this.sunLight);
+
+    // Warm coastal ambient & ground bounce
+    this.hemiLight = new THREE.HemisphereLight(0x74b9ff, 0x3d7042, 0.45);
+    this.scene.add(this.hemiLight);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    this.scene.add(ambient);
+
+    window.addEventListener('resize', () => {
+      this.camera.aspect = window.innerWidth / window.innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+    });
   }
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+  initAudio() {
+    this.audio = new AudioManager();
   }
 
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+  initWorld() {
+    this.city = new City(this.scene);
+    this.vehicleManager = new VehicleManager(this.scene, this.city, this.audio);
+    this.player = new Player(this.scene, this.camera, this.city, this.audio);
+    this.trafficManager = new TrafficManager(this.scene, this.city, this.vehicleManager, this.audio);
+    this.policeManager = new PoliceManager(this.scene, this.city, this.vehicleManager, this.audio);
+    this.missionManager = new MissionManager(this.scene, this.audio);
+  }
+
+  initHUD() {
+    const hudContainer = document.getElementById('hud');
+    this.hud = new HUD(hudContainer);
+  }
+
+  setupInputListeners() {
+    window.addEventListener('keydown', (e) => {
+      this.audio.ensureContext();
+      const code = e.code;
+
+      if (code === 'KeyW' || code === 'ArrowUp') this.input.forward = true;
+      if (code === 'KeyS' || code === 'ArrowDown') this.input.backward = true;
+      if (code === 'KeyA' || code === 'ArrowLeft') this.input.left = true;
+      if (code === 'KeyD' || code === 'ArrowRight') this.input.right = true;
+      if (code === 'ShiftLeft' || code === 'ShiftRight') this.input.sprint = true;
+      if (code === 'Space') {
+        this.input.jump = true;
+        this.input.brake = true;
       }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
+      if (code === 'KeyF') this.input.attack = true;
+
+      // Enter / Exit Vehicle (E)
+      if (code === 'KeyE') {
+        if (this.player.inVehicle) {
+          this.player.exitVehicle();
+          this.vehicleManager.playerVehicle = null;
+        } else {
+          const nearVeh = this.vehicleManager.getNearestVehicle(this.player.position, 4.2);
+          if (nearVeh) {
+            this.player.enterVehicle(nearVeh);
+            this.vehicleManager.playerVehicle = nearVeh;
+            if (nearVeh.isPolice) {
+              this.policeManager.reportCrime('theft', this.player.position);
+            }
+          }
+        }
+      }
+
+      // Switch Weapon (Q or 1 / 2)
+      if (code === 'KeyQ') this.player.switchWeapon();
+      if (code === 'Digit1') {
+        this.player.currentWeaponIndex = 0;
+        this.player.switchWeapon();
+      }
+      if (code === 'Digit2') {
+        this.player.currentWeaponIndex = 1;
+        this.player.switchWeapon();
+      }
+
+      // Mute audio (M)
+      if (code === 'KeyM') this.audio.toggleMute();
+
+      // Pause menu (Escape / KeyP)
+      if (code === 'Escape' || code === 'KeyP') {
+        if (this.state === 'PLAYING') this.togglePause();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const code = e.code;
+      if (code === 'KeyW' || code === 'ArrowUp') this.input.forward = false;
+      if (code === 'KeyS' || code === 'ArrowDown') this.input.backward = false;
+      if (code === 'KeyA' || code === 'ArrowLeft') this.input.left = false;
+      if (code === 'KeyD' || code === 'ArrowRight') this.input.right = false;
+      if (code === 'ShiftLeft' || code === 'ShiftRight') this.input.sprint = false;
+      if (code === 'Space') {
+        this.input.jump = false;
+        this.input.brake = false;
+      }
+      if (code === 'KeyF') this.input.attack = false;
+    });
+
+    // Mouse Controls
+    window.addEventListener('mousedown', (e) => {
+      this.audio.ensureContext();
+      if (this.state !== 'PLAYING') return;
+
+      if (e.button === 0) { // Left Click: Attack / Shoot
+        this.input.attack = true;
+      } else if (e.button === 2) { // Right Click: Aim
+        this.input.aim = true;
+      }
+    });
+
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 0) this.input.attack = false;
+      if (e.button === 2) this.input.aim = false;
+    });
+
+    window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Mouse movement for Camera Look
+    window.addEventListener('mousemove', (e) => {
+      if (this.state !== 'PLAYING') return;
+      // When mouse moves, adjust camera yaw and pitch
+      if (document.pointerLockElement || e.buttons > 0 || this.player.isAiming) {
+        const sens = 0.0035;
+        this.player.camYaw -= e.movementX * sens;
+        this.player.camPitch = Math.max(-0.4, Math.min(0.85, this.player.camPitch + e.movementY * sens));
+      }
+    });
+
+    // Canvas click to request pointer lock for full 3D control
+    const canvas = document.getElementById('game-canvas');
+    canvas.addEventListener('click', () => {
+      if (this.state === 'PLAYING' && !document.pointerLockElement) {
+        canvas.requestPointerLock?.();
+      }
+    });
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
+  setupMenus() {
+    const startMenu = document.getElementById('menu-start');
+    const pauseMenu = document.getElementById('menu-pause');
+    const btnNewGame = document.getElementById('btn-new-game');
+    const btnContinue = document.getElementById('btn-continue');
+    const btnResume = document.getElementById('btn-resume');
+    const btnMissions = document.getElementById('btn-missions');
 
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
+    if (btnNewGame) {
+      btnNewGame.addEventListener('click', () => {
+        this.audio.ensureContext();
+        SaveSystem.reset();
+        this.state = 'PLAYING';
+        startMenu.classList.add('hidden');
+        this.missionManager.startMission('mission_1');
+      });
+    }
+
+    if (btnContinue) {
+      if (!SaveSystem.hasSave()) {
+        btnContinue.classList.add('disabled');
+      }
+      btnContinue.addEventListener('click', () => {
+        this.audio.ensureContext();
+        SaveSystem.load(this.player, this.missionManager, this.policeManager);
+        this.state = 'PLAYING';
+        startMenu.classList.add('hidden');
+      });
+    }
+
+    if (btnResume) {
+      btnResume.addEventListener('click', () => {
+        this.togglePause();
+      });
+    }
+
+    if (btnMissions) {
+      btnMissions.addEventListener('click', () => {
+        this.missionManager.startMission('mission_1');
+        this.togglePause();
+      });
+    }
+  }
+
+  togglePause() {
+    this.isPaused = !this.isPaused;
+    const pauseMenu = document.getElementById('menu-pause');
+    if (this.isPaused) {
+      this.state = 'PAUSED';
+      if (pauseMenu) pauseMenu.classList.remove('hidden');
+      SaveSystem.save(this.player, this.missionManager, this.policeManager);
+    } else {
+      this.state = 'PLAYING';
+      if (pauseMenu) pauseMenu.classList.add('hidden');
+    }
+  }
+
+  loop(now) {
+    requestAnimationFrame(this.loop);
+
+    const delta = Math.min((now - this.lastTime) / 1000, 0.06);
+    this.lastTime = now;
+
+    if (this.state === 'PLAYING') {
+      // 1. Update Core Simulation Systems
+      this.player.update(delta, this.input, this.trafficManager, this.policeManager, this.isStaged);
+      this.vehicleManager.update(delta, this.input);
+      this.trafficManager.update(delta, this.player);
+      this.policeManager.update(delta, this.player);
+      this.missionManager.update(delta, this.player, this.policeManager);
+      this.city.update(delta);
+
+      // Check car vs pedestrians & player collision
+      if (this.player.inVehicle) {
+        this.trafficManager.checkCarCollisionsWithPedestrians(this.player.currentVehicle, () => {
+          this.policeManager.reportCrime('hit_and_run', this.player.position);
+        });
+      } else {
+        this.trafficManager.checkCarCollisionsWithPlayer(this.player);
+      }
+
+      // Dynamic sunlight following player
+      this.sunLight.position.x = this.player.position.x + 120;
+      this.sunLight.position.z = this.player.position.z + 90;
+      this.sunLight.target.position.set(this.player.position.x, 0, this.player.position.z);
+      this.sunLight.target.updateMatrixWorld();
+
+      // Respawn timer on death
+      if (this.player.isWasted) {
+        if (!this.wastedTimer) this.wastedTimer = 0;
+        this.wastedTimer += delta;
+        if (this.wastedTimer > 3.5) {
+          this.player.respawn();
+          this.policeManager.clearWanted();
+          this.wastedTimer = 0;
+        }
+      }
+    }
+
+    // 2. Update HUD
+    if (this.hud) {
+      this.hud.update(
+        this.player,
+        this.city,
+        this.vehicleManager,
+        this.trafficManager,
+        this.policeManager,
+        this.missionManager
+      );
+    }
+
+    // 3. Render Three.js Scene
+    this.renderer.render(this.scene, this.camera);
+  }
 }
 
-if (shot) runShot(shot);
-else runGame();
+// Instantiate game when DOM is loaded
+window.addEventListener('DOMContentLoaded', () => {
+  window.solariaGame = new Game();
+});
